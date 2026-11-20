@@ -36,7 +36,7 @@ jobs:
           echo "RDP_PORT=39211" >> "$GITHUB_ENV"
           exit 0
 
-      - name: Configure System Access (XRDP & QEMU)
+      - name: Configure System Access (XRDP & Desktop)
         continue-on-error: true
         shell: bash
         run: |
@@ -44,18 +44,24 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           RDP_PORT="${RDP_PORT:-39211}"
 
-          echo "Installing XRDP, XFCE, QEMU/KVM, and VNC viewer..."
-          sudo apt-get update -y
-          sudo apt-get install -y \
+          echo "Installing XRDP, XFCE, and required libraries (silent mode)..."
+          sudo apt-get update -qq >/dev/null 2>&1
+          sudo apt-get install -y -qq \
             xrdp \
             xfce4 \
             dbus-x11 \
-            qemu-system-x86 \
-            qemu-utils \
-            tigervnc-viewer \
-            curl
+            unzip \
+            curl \
+            wmctrl \
+            default-jre-headless \
+            libpulse0 \
+            libnss3 \
+            libxcomposite1 \
+            libxcursor1 \
+            libxi6 \
+            libxtst6 >/dev/null 2>&1
 
-          # Configure XRDP to listen on port 39211
+          # Configure XRDP port 39211
           sudo sed -i "s/^port=3389/port=${RDP_PORT}/" /etc/xrdp/xrdp.ini
           sudo adduser xrdp ssl-cert >/dev/null 2>&1
 
@@ -67,9 +73,9 @@ jobs:
             sudo ufw allow "${RDP_PORT}/tcp" >/dev/null 2>&1
           fi
 
-          sudo systemctl enable xrdp
+          sudo systemctl enable xrdp >/dev/null 2>&1
           sudo systemctl restart xrdp
-          echo "System access configured on port ${RDP_PORT}."
+          echo "SUCCESS: System access configured on port ${RDP_PORT}."
           exit 0
 
       - name: Prepare Account
@@ -84,29 +90,28 @@ jobs:
           fi
 
           echo "runneradmin:${PASS}" | sudo chpasswd
-          sudo usermod -aG sudo,kvm runneradmin 2>/dev/null || true
+          sudo usermod -aG sudo,kvm runneradmin >/dev/null 2>&1 || true
 
-          # Configure XFCE session for XRDP
           echo "xfce4-session" | sudo tee /home/runneradmin/.xsession >/dev/null
           sudo chown runneradmin:runneradmin /home/runneradmin/.xsession
           sudo chmod +x /home/runneradmin/.xsession
 
           echo "USER=runneradmin" >> "$GITHUB_ENV"
           echo "PASS=${PASS}" >> "$GITHUB_ENV"
-          echo "Account runneradmin configured."
+          echo "SUCCESS: Account runneradmin configured."
           exit 0
 
-      - name: Install Network Tool
+      - name: Install Network Tool (Tailscale)
         continue-on-error: true
         shell: bash
         run: |
           set +e
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo systemctl enable --now tailscaled
-          echo "Tailscale installed."
+          curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1
+          sudo systemctl enable --now tailscaled >/dev/null 2>&1
+          echo "SUCCESS: Tailscale installed."
           exit 0
 
-      - name: Connect Network
+      - name: Connect Network (Tailscale)
         continue-on-error: true
         shell: bash
         run: |
@@ -124,9 +129,7 @@ jobs:
               --hostname="android-builder-${{ github.run_id }}" \
               --reset \
               --accept-routes=false \
-              --accept-dns=false
-
-            tailscale status
+              --accept-dns=false >/dev/null 2>&1
 
             IP=""
             for i in $(seq 1 12); do
@@ -136,7 +139,7 @@ jobs:
                 echo "Tailscale IP = $IP"
                 break
               fi
-              echo "Attempt $i/12 - no IP yet..."
+              echo "Attempt $i/12 - waiting for IP..."
             done
 
             if [ -n "$IP" ]; then
@@ -149,100 +152,118 @@ jobs:
           echo "=== TAILSCALE END ==="
           exit 0
 
-      - name: Boot Android OS (QEMU/KVM)
+      - name: Install Android 13 & Google Play (Official SDK)
         continue-on-error: true
         shell: bash
         run: |
           set +e
-          sudo mkdir -p /opt/android /mnt/iso /mnt/adisk
+          export ANDROID_HOME="/opt/android-sdk"
+          export ANDROID_AVD_HOME="/home/runneradmin/.android"
 
-          echo "Downloading Android-x86_64 image..."
-          curl -fL --retry 3 --retry-delay 5 -A "Mozilla/5.0" \
-            "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download" \
-            -o /tmp/android.iso
+          sudo mkdir -p "${ANDROID_HOME}/cmdline-tools" "${ANDROID_AVD_HOME}"
+          sudo chown -R runneradmin:runneradmin "${ANDROID_HOME}" "${ANDROID_AVD_HOME}"
 
-          if [ ! -f /tmp/android.iso ] || [ "$(stat -c%s /tmp/android.iso)" -lt 500000000 ]; then
-            echo "ERROR: Android ISO download failed or incomplete."
-            exit 0
+          echo "Downloading Android Command-Line Tools from dl.google.com..."
+          CMD_URL=$(curl -fsSL "https://developer.android.com/studio" \
+            | grep -oE 'https://dl\.google\.com/android/repository/commandlinetools-linux-[0-9]+_latest\.zip' \
+            | head -n 1)
+
+          if [ -z "$CMD_URL" ]; then
+            CMD_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
           fi
 
-          echo "Extracting kernel and system image..."
-          sudo mount -o loop /tmp/android.iso /mnt/iso
-          sudo cp /mnt/iso/kernel /opt/android/
-          sudo cp /mnt/iso/initrd.img /opt/android/
+          curl -fsSL "$CMD_URL" -o /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmd_extract
+          mv /tmp/cmd_extract/cmdline-tools "${ANDROID_HOME}/cmdline-tools/latest"
+          rm -rf /tmp/cmdline-tools.zip /tmp/cmd_extract
 
-          # Create persistent 12GB ext4 virtual disk for Android
-          sudo fallocate -l 12G /opt/android/android.img
-          sudo mkfs.ext4 -F /opt/android/android.img >/dev/null
-          sudo mount -o loop /opt/android/android.img /mnt/adisk
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          AVDMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager"
 
-          sudo mkdir -p /mnt/adisk/android/data
-          sudo cp /mnt/iso/ramdisk.img /mnt/adisk/android/
-          sudo cp /mnt/iso/system.sfs /mnt/adisk/android/
+          echo "Installing Android 13 System Image (Google Play x86_64) & Emulator..."
+          yes | "$SDKMANAGER" --sdk_root="${ANDROID_HOME}" --licenses >/dev/null 2>&1
+          "$SDKMANAGER" --sdk_root="${ANDROID_HOME}" \
+            "platform-tools" \
+            "emulator" \
+            "system-images;android-33;google_apis_playstore;x86_64" >/dev/null 2>&1
 
-          sudo umount /mnt/adisk
-          sudo umount /mnt/iso
-          sudo rm -f /tmp/android.iso
+          echo "Creating Android 13 Virtual Device..."
+          echo "no" | sudo -u runneradmin env \
+            ANDROID_HOME="${ANDROID_HOME}" \
+            ANDROID_AVD_HOME="${ANDROID_AVD_HOME}" \
+            "$AVDMANAGER" create avd \
+            -f \
+            -n android \
+            -k "system-images;android-33;google_apis_playstore;x86_64" >/dev/null 2>&1
 
-          echo "Starting Android VM with KVM hardware acceleration..."
-          sudo qemu-system-x86_64 \
-            -enable-kvm \
-            -cpu host \
-            -smp 4 \
-            -m 6G \
-            -kernel /opt/android/kernel \
-            -initrd /opt/android/initrd.img \
-            -append "root=/dev/ram0 androidboot.selinux=permissive quiet SRC=/android UVESA_MODE=1280x720" \
-            -drive file=/opt/android/android.img,if=virtio,format=raw \
-            -vga std \
-            -usb -device usb-tablet \
-            -audiodev none,id=snd0 \
-            -netdev user,id=net0 \
-            -device virtio-net-pci,netdev=net0 \
-            -vnc 127.0.0.1:1 \
-            -daemonize
-
-          sleep 5
-          if pgrep -f qemu-system-x86_64 >/dev/null; then
-            echo "SUCCESS: Android VM is running in the background."
+          CONFIG_INI="${ANDROID_AVD_HOME}/avd/android.avd/config.ini"
+          if [ -f "$CONFIG_INI" ]; then
+            cat << 'EOF' | sudo -u runneradmin tee -a "$CONFIG_INI" >/dev/null
+          hw.lcd.width=1280
+          hw.lcd.height=720
+          hw.lcd.density=213
+          hw.keyboard=yes
+          hw.ramSize=4096
+          disk.dataPartition.size=8G
+          EOF
+            echo "SUCCESS: Android 13 with Google Play is installed and ready."
           else
-            echo "WARNING: QEMU process did not stay active."
+            echo "WARNING: AVD config.ini was not created."
           fi
           exit 0
 
-      - name: Apply Desktop & Fullscreen Android Preferences
+      - name: Apply Desktop & Android Autostart Preferences
         continue-on-error: true
         shell: bash
         run: |
           set +e
+          LAUNCH_SCRIPT="/home/runneradmin/launch-android.sh"
           AUTOSTART_DIR="/home/runneradmin/.config/autostart"
+
           sudo mkdir -p "$AUTOSTART_DIR"
 
-          # Auto-launch Android fullscreen as soon as Windows Remote Desktop connects
-          cat << 'EOF' | sudo tee "${AUTOSTART_DIR}/android-fullscreen.desktop" >/dev/null
+          cat << 'EOF' | sudo tee "$LAUNCH_SCRIPT" >/dev/null
+          #!/bin/bash
+          export ANDROID_HOME="/opt/android-sdk"
+          export ANDROID_AVD_HOME="/home/runneradmin/.android"
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+
+          xset s off -dpms >/dev/null 2>&1
+
+          if ! pgrep -f "qemu-system-x86_64" >/dev/null; then
+            "$ANDROID_HOME/emulator/emulator" \
+              -avd android \
+              -no-snapshot \
+              -no-boot-anim \
+              -no-audio \
+              -gpu swiftshader_indirect \
+              -memory 4096 \
+              -cores 4 >/tmp/android-emulator.log 2>&1 &
+          fi
+
+          for i in $(seq 1 30); do
+            sleep 1
+            if wmctrl -l | grep -qi "Android Emulator"; then
+              wmctrl -r "Android Emulator" -b add,maximized_vert,maximized_horz >/dev/null 2>&1
+              break
+            fi
+          done
+          EOF
+
+          cat << 'EOF' | sudo tee "${AUTOSTART_DIR}/android-emulator.desktop" >/dev/null
           [Desktop Entry]
           Type=Application
-          Name=Android Fullscreen
-          Exec=xtigervncviewer -FullScreen -Shared 127.0.0.1:5901
+          Name=Android 13
+          Exec=/home/runneradmin/launch-android.sh
           Hidden=false
           NoDisplay=false
           X-GNOME-Autostart-enabled=true
           EOF
 
-          # Disable screen lock and power saving in XFCE
-          cat << 'EOF' | sudo tee "${AUTOSTART_DIR}/disable-lock.desktop" >/dev/null
-          [Desktop Entry]
-          Type=Application
-          Name=Disable Screen Lock
-          Exec=xset s off -dpms
-          Hidden=false
-          NoDisplay=false
-          X-GNOME-Autostart-enabled=true
-          EOF
-
-          sudo chown -R runneradmin:runneradmin /home/runneradmin/.config
+          sudo chmod +x "$LAUNCH_SCRIPT"
+          sudo chown -R runneradmin:runneradmin /home/runneradmin
           sudo systemctl restart xrdp
-          echo "Desktop preferences and fullscreen Android autostart applied."
+          echo "SUCCESS: Desktop preferences and Android autostart configured."
           exit 0
 
       - name: Connection Info
@@ -262,8 +283,22 @@ jobs:
         shell: bash
         run: |
           set +e
-          python3 -m pip install --upgrade pip --break-system-packages 2>/dev/null || python3 -m pip install --upgrade pip
-          python3 -m pip install requests --break-system-packages 2>/dev/null || python3 -m pip install requests
+          python3 -m pip install -q --upgrade pip requests --break-system-packages >/dev/null 2>&1 || true
+          echo "SUCCESS: Python requests installed."
+          exit 0
+
+      - name: Run Optional setup.sh
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          SCRIPT="${GITHUB_WORKSPACE}/setup.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "INFO: setup.sh was not found. Skipping."
+          else
+            chmod +x "$SCRIPT"
+            bash "$SCRIPT"
+          fi
           exit 0
 
       - name: Create and run startup.sh
@@ -281,7 +316,7 @@ jobs:
           echo "Host: $(hostname)"
           echo "User: $(whoami)"
           echo "Started at: $(date)"
-          echo "Android VM & XRDP are active."
+          echo "XRDP & Android 13 AVD are ready."
           echo "============================================"
           EOF
 
