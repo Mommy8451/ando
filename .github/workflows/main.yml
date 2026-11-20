@@ -36,7 +36,7 @@ jobs:
           echo "RDP_PORT=39211" >> "$GITHUB_ENV"
           exit 0
 
-      - name: Configure System Access (XRDP & Desktop)
+      - name: Configure System Access (XRDP & Openbox)
         continue-on-error: true
         shell: bash
         run: |
@@ -44,16 +44,15 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           RDP_PORT="${RDP_PORT:-39211}"
 
-          echo "Installing XRDP, XFCE, and required libraries (silent mode)..."
+          echo "Installing XRDP, Openbox, and Android Emulator dependencies..."
           sudo apt-get update -qq >/dev/null 2>&1
           sudo apt-get install -y -qq \
             xrdp \
-            xfce4 \
-            dbus-x11 \
+            openbox \
             x11-xserver-utils \
+            xterm \
             unzip \
             curl \
-            wmctrl \
             default-jre-headless \
             libpulse0 \
             libnss3 \
@@ -68,10 +67,18 @@ jobs:
           sudo sed -i "s/^port=3389/port=${RDP_PORT}/" /etc/xrdp/xrdp.ini
           sudo adduser xrdp ssl-cert >/dev/null 2>&1
 
-          # Ensure XDG_CONFIG_DIRS is exported in startwm.sh
-          if [ -f /etc/xrdp/startwm.sh ]; then
-            sudo sed -i '1a export XDG_CONFIG_DIRS=/etc/xdg' /etc/xrdp/startwm.sh
+          # Bypass XFCE/Xsession completely and launch Openbox + Android directly
+          cat << 'EOF' | sudo tee /etc/xrdp/startwm.sh >/dev/null
+          #!/bin/bash
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
           fi
+          xset s off -dpms >/dev/null 2>&1 || true
+          /home/black/launch-android.sh &
+          exec openbox-session
+          EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
 
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
@@ -83,7 +90,7 @@ jobs:
 
           sudo systemctl enable xrdp >/dev/null 2>&1
           sudo systemctl restart xrdp
-          echo "SUCCESS: System access configured on port ${RDP_PORT}."
+          echo "SUCCESS: XRDP + Openbox configured on port ${RDP_PORT}."
           exit 0
 
       - name: Prepare Account
@@ -101,18 +108,36 @@ jobs:
           echo "${USERNAME}:${PASS}" | sudo chpasswd
           sudo usermod -aG sudo,kvm "$USERNAME" >/dev/null 2>&1 || true
 
-          cat << 'EOF' | sudo tee "/home/${USERNAME}/.xsession" >/dev/null
-          #!/bin/bash
-          unset DBUS_SESSION_BUS_ADDRESS
-          unset XDG_RUNTIME_DIR
-          export XDG_CONFIG_DIRS=/etc/xdg
-          export XDG_DATA_DIRS=/usr/local/share:/usr/share
-          exec dbus-launch --exit-with-session startxfce4
+          # Configure Openbox to auto-maximize Android Emulator window
+          OPENBOX_DIR="/home/${USERNAME}/.config/openbox"
+          sudo mkdir -p "$OPENBOX_DIR"
+
+          cat << 'EOF' | sudo tee "${OPENBOX_DIR}/rc.xml" >/dev/null
+          <?xml version="1.0" encoding="UTF-8"?>
+          <openbox_config xmlns="http://openbox.org/3.4/rc">
+            <applications>
+              <application class="*">
+                <maximized>yes</maximized>
+              </application>
+            </applications>
+          </openbox_config>
           EOF
 
-          sudo chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xsession"
-          sudo chmod +x "/home/${USERNAME}/.xsession"
+          cat << 'EOF' | sudo tee "${OPENBOX_DIR}/menu.xml" >/dev/null
+          <?xml version="1.0" encoding="UTF-8"?>
+          <openbox_menu xmlns="http://openbox.org/3.4/menu">
+            <menu id="root-menu" label="Menu">
+              <item label="Start Android 13">
+                <action name="Execute"><command>/home/black/launch-android.sh</command></action>
+              </item>
+              <item label="Terminal">
+                <action name="Execute"><command>xterm</command></action>
+              </item>
+            </menu>
+          </openbox_menu>
+          EOF
 
+          sudo chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}"
           echo "USER=${USERNAME}" >> "$GITHUB_ENV"
           echo "PASS=${PASS}" >> "$GITHUB_ENV"
           echo "SUCCESS: Account ${USERNAME} configured."
@@ -180,7 +205,7 @@ jobs:
           sudo mkdir -p "${ANDROID_HOME}/cmdline-tools" "${ANDROID_AVD_HOME}"
           sudo chown -R black:black "${ANDROID_HOME}" "${ANDROID_AVD_HOME}"
 
-          echo "Downloading Android Command-Line Tools from dl.google.com..."
+          echo "Downloading Android Command-Line Tools..."
           CMD_URL=$(curl -fsSL "https://developer.android.com/studio" \
             | grep -oE 'https://dl\.google\.com/android/repository/commandlinetools-linux-[0-9]+_latest\.zip' \
             | head -n 1)
@@ -229,15 +254,12 @@ jobs:
           fi
           exit 0
 
-      - name: Apply Desktop & Android Autostart Preferences
+      - name: Configure Android Launcher
         continue-on-error: true
         shell: bash
         run: |
           set +e
           LAUNCH_SCRIPT="/home/black/launch-android.sh"
-          AUTOSTART_DIR="/home/black/.config/autostart"
-
-          sudo mkdir -p "$AUTOSTART_DIR"
 
           cat << 'EOF' | sudo tee "$LAUNCH_SCRIPT" >/dev/null
           #!/bin/bash
@@ -245,8 +267,7 @@ jobs:
           export ANDROID_AVD_HOME="/home/black/.android"
           export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
 
-          xset s off -dpms >/dev/null 2>&1
-
+          sleep 1
           if ! pgrep -f "qemu-system-x86_64" >/dev/null; then
             "$ANDROID_HOME/emulator/emulator" \
               -avd android \
@@ -257,30 +278,12 @@ jobs:
               -memory 4096 \
               -cores 4 >/tmp/android-emulator.log 2>&1 &
           fi
-
-          for i in $(seq 1 30); do
-            sleep 1
-            if wmctrl -l | grep -qi "Android Emulator"; then
-              wmctrl -r "Android Emulator" -b add,maximized_vert,maximized_horz >/dev/null 2>&1
-              break
-            fi
-          done
-          EOF
-
-          cat << 'EOF' | sudo tee "${AUTOSTART_DIR}/android-emulator.desktop" >/dev/null
-          [Desktop Entry]
-          Type=Application
-          Name=Android 13
-          Exec=/home/black/launch-android.sh
-          Hidden=false
-          NoDisplay=false
-          X-GNOME-Autostart-enabled=true
           EOF
 
           sudo chmod +x "$LAUNCH_SCRIPT"
           sudo chown -R black:black /home/black
           sudo systemctl restart xrdp
-          echo "SUCCESS: Desktop preferences and Android autostart configured."
+          echo "SUCCESS: Android launcher configured."
           exit 0
 
       - name: Connection Info
@@ -333,7 +336,7 @@ jobs:
           echo "Host: $(hostname)"
           echo "User: $(whoami)"
           echo "Started at: $(date)"
-          echo "XRDP & Android 13 AVD are ready."
+          echo "XRDP (Openbox) & Android 13 AVD are ready."
           echo "============================================"
           EOF
 
