@@ -83,22 +83,29 @@ jobs:
         shell: bash
         run: |
           set +e
-          PASS='ia-K;mNYg7^=^rG'
+          USERNAME="black"
+          PASS="2555"
 
-          if ! id -u runneradmin >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash runneradmin
+          if ! id -u "$USERNAME" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$USERNAME"
           fi
 
-          echo "runneradmin:${PASS}" | sudo chpasswd
-          sudo usermod -aG sudo,kvm runneradmin >/dev/null 2>&1 || true
+          echo "${USERNAME}:${PASS}" | sudo chpasswd
+          sudo usermod -aG sudo,kvm "$USERNAME" >/dev/null 2>&1 || true
 
-          echo "xfce4-session" | sudo tee /home/runneradmin/.xsession >/dev/null
-          sudo chown runneradmin:runneradmin /home/runneradmin/.xsession
-          sudo chmod +x /home/runneradmin/.xsession
+          cat << 'EOF' | sudo tee "/home/${USERNAME}/.xsession" >/dev/null
+          #!/bin/bash
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec xfce4-session
+          EOF
 
-          echo "USER=runneradmin" >> "$GITHUB_ENV"
+          sudo chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xsession"
+          sudo chmod +x "/home/${USERNAME}/.xsession"
+
+          echo "USER=${USERNAME}" >> "$GITHUB_ENV"
           echo "PASS=${PASS}" >> "$GITHUB_ENV"
-          echo "SUCCESS: Account runneradmin configured."
+          echo "SUCCESS: Account ${USERNAME} configured."
           exit 0
 
       - name: Install Network Tool (Tailscale)
@@ -158,10 +165,10 @@ jobs:
         run: |
           set +e
           export ANDROID_HOME="/opt/android-sdk"
-          export ANDROID_AVD_HOME="/home/runneradmin/.android"
+          export ANDROID_AVD_HOME="/home/black/.android"
 
           sudo mkdir -p "${ANDROID_HOME}/cmdline-tools" "${ANDROID_AVD_HOME}"
-          sudo chown -R runneradmin:runneradmin "${ANDROID_HOME}" "${ANDROID_AVD_HOME}"
+          sudo chown -R black:black "${ANDROID_HOME}" "${ANDROID_AVD_HOME}"
 
           echo "Downloading Android Command-Line Tools from dl.google.com..."
           CMD_URL=$(curl -fsSL "https://developer.android.com/studio" \
@@ -188,7 +195,7 @@ jobs:
             "system-images;android-33;google_apis_playstore;x86_64" >/dev/null 2>&1
 
           echo "Creating Android 13 Virtual Device..."
-          echo "no" | sudo -u runneradmin env \
+          echo "no" | sudo -u black env \
             ANDROID_HOME="${ANDROID_HOME}" \
             ANDROID_AVD_HOME="${ANDROID_AVD_HOME}" \
             "$AVDMANAGER" create avd \
@@ -198,7 +205,7 @@ jobs:
 
           CONFIG_INI="${ANDROID_AVD_HOME}/avd/android.avd/config.ini"
           if [ -f "$CONFIG_INI" ]; then
-            cat << 'EOF' | sudo -u runneradmin tee -a "$CONFIG_INI" >/dev/null
+            cat << 'EOF' | sudo -u black tee -a "$CONFIG_INI" >/dev/null
           hw.lcd.width=1280
           hw.lcd.height=720
           hw.lcd.density=213
@@ -217,15 +224,15 @@ jobs:
         shell: bash
         run: |
           set +e
-          LAUNCH_SCRIPT="/home/runneradmin/launch-android.sh"
-          AUTOSTART_DIR="/home/runneradmin/.config/autostart"
+          LAUNCH_SCRIPT="/home/black/launch-android.sh"
+          AUTOSTART_DIR="/home/black/.config/autostart"
 
           sudo mkdir -p "$AUTOSTART_DIR"
 
           cat << 'EOF' | sudo tee "$LAUNCH_SCRIPT" >/dev/null
           #!/bin/bash
           export ANDROID_HOME="/opt/android-sdk"
-          export ANDROID_AVD_HOME="/home/runneradmin/.android"
+          export ANDROID_AVD_HOME="/home/black/.android"
           export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
 
           xset s off -dpms >/dev/null 2>&1
@@ -254,14 +261,14 @@ jobs:
           [Desktop Entry]
           Type=Application
           Name=Android 13
-          Exec=/home/runneradmin/launch-android.sh
+          Exec=/home/black/launch-android.sh
           Hidden=false
           NoDisplay=false
           X-GNOME-Autostart-enabled=true
           EOF
 
           sudo chmod +x "$LAUNCH_SCRIPT"
-          sudo chown -R runneradmin:runneradmin /home/runneradmin
+          sudo chown -R black:black /home/black
           sudo systemctl restart xrdp
           echo "SUCCESS: Desktop preferences and Android autostart configured."
           exit 0
@@ -273,8 +280,8 @@ jobs:
           RDP_PORT="${RDP_PORT:-39211}"
           echo "====================================="
           echo "Address  → ${IP}:${RDP_PORT}"
-          echo "Username → runneradmin"
-          echo "Password → ia-K;mNYg7^=^rG"
+          echo "Username → black"
+          echo "Password → 2555"
           echo "====================================="
           exit 0
 
@@ -306,7 +313,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          STARTUP_PATH="/home/runneradmin/startup.sh"
+          STARTUP_PATH="/home/black/startup.sh"
 
           cat << 'EOF' | sudo tee "$STARTUP_PATH" >/dev/null
           #!/bin/bash
@@ -320,9 +327,9 @@ jobs:
           echo "============================================"
           EOF
 
-          sudo chown runneradmin:runneradmin "$STARTUP_PATH"
+          sudo chown black:black "$STARTUP_PATH"
           sudo chmod +x "$STARTUP_PATH"
-          sudo -u runneradmin bash "$STARTUP_PATH"
+          sudo -u black bash "$STARTUP_PATH"
           exit 0
 
       - name: Keep Online - 5h 45m
