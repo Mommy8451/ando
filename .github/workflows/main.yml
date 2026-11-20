@@ -50,6 +50,7 @@ jobs:
             xrdp \
             xfce4 \
             dbus-x11 \
+            x11-xserver-utils \
             unzip \
             curl \
             wmctrl \
@@ -59,11 +60,18 @@ jobs:
             libxcomposite1 \
             libxcursor1 \
             libxi6 \
-            libxtst6 >/dev/null 2>&1
+            libxtst6 \
+            libxcb-cursor0 \
+            libxkbfile1 >/dev/null 2>&1
 
           # Configure XRDP port 39211
           sudo sed -i "s/^port=3389/port=${RDP_PORT}/" /etc/xrdp/xrdp.ini
           sudo adduser xrdp ssl-cert >/dev/null 2>&1
+
+          # Ensure XDG_CONFIG_DIRS is exported in startwm.sh
+          if [ -f /etc/xrdp/startwm.sh ]; then
+            sudo sed -i '1a export XDG_CONFIG_DIRS=/etc/xdg' /etc/xrdp/startwm.sh
+          fi
 
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
@@ -97,7 +105,9 @@ jobs:
           #!/bin/bash
           unset DBUS_SESSION_BUS_ADDRESS
           unset XDG_RUNTIME_DIR
-          exec xfce4-session
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_DATA_DIRS=/usr/local/share:/usr/share
+          exec dbus-launch --exit-with-session startxfce4
           EOF
 
           sudo chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xsession"
