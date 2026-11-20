@@ -1,4 +1,4 @@
-name: Android RDP Pipeline
+name: Android 11 Tablet RDP
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          echo "Starting Android RDP pipeline..."
+          echo "Starting lightweight Android 11 pipeline..."
           echo "RDP_PORT=39211" >> "$GITHUB_ENV"
           exit 0
 
@@ -63,17 +63,16 @@ jobs:
             libxcb-cursor0 \
             libxkbfile1 >/dev/null 2>&1
 
-          # Configure XRDP port 39211
           sudo sed -i "s/^port=3389/port=${RDP_PORT}/" /etc/xrdp/xrdp.ini
           sudo adduser xrdp ssl-cert >/dev/null 2>&1
 
-          # Bypass XFCE/Xsession completely and launch Openbox + Android directly
           cat << 'EOF' | sudo tee /etc/xrdp/startwm.sh >/dev/null
           #!/bin/bash
           if [ -r /etc/default/locale ]; then
             . /etc/default/locale
             export LANG LANGUAGE
           fi
+          xsetroot -solid "#000000" >/dev/null 2>&1 || true
           xset s off -dpms >/dev/null 2>&1 || true
           /home/black/launch-android.sh &
           exec openbox-session
@@ -108,7 +107,7 @@ jobs:
           echo "${USERNAME}:${PASS}" | sudo chpasswd
           sudo usermod -aG sudo,kvm "$USERNAME" >/dev/null 2>&1 || true
 
-          # Configure Openbox to auto-maximize Android Emulator window
+          # Center Android window cleanly without distortion or stretching
           OPENBOX_DIR="/home/${USERNAME}/.config/openbox"
           sudo mkdir -p "$OPENBOX_DIR"
 
@@ -117,7 +116,11 @@ jobs:
           <openbox_config xmlns="http://openbox.org/3.4/rc">
             <applications>
               <application class="*">
-                <maximized>yes</maximized>
+                <decor>no</decor>
+                <position force="yes">
+                  <x>center</x>
+                  <y>center</y>
+                </position>
               </application>
             </applications>
           </openbox_config>
@@ -127,7 +130,7 @@ jobs:
           <?xml version="1.0" encoding="UTF-8"?>
           <openbox_menu xmlns="http://openbox.org/3.4/menu">
             <menu id="root-menu" label="Menu">
-              <item label="Start Android 13">
+              <item label="Start Android 11">
                 <action name="Execute"><command>/home/black/launch-android.sh</command></action>
               </item>
               <item label="Terminal">
@@ -168,7 +171,7 @@ jobs:
 
             sudo tailscale up \
               --authkey="${KEY}" \
-              --hostname="android-builder-${{ github.run_id }}" \
+              --hostname="android11-tablet-${{ github.run_id }}" \
               --reset \
               --accept-routes=false \
               --accept-dns=false >/dev/null 2>&1
@@ -194,13 +197,14 @@ jobs:
           echo "=== TAILSCALE END ==="
           exit 0
 
-      - name: Install Android 13 & Google Play (Official SDK)
+      - name: Install & Pre-Boot Android 11 (Ultra-Wide Tablet)
         continue-on-error: true
         shell: bash
         run: |
           set +e
           export ANDROID_HOME="/opt/android-sdk"
           export ANDROID_AVD_HOME="/home/black/.android"
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
 
           sudo mkdir -p "${ANDROID_HOME}/cmdline-tools" "${ANDROID_AVD_HOME}"
           sudo chown -R black:black "${ANDROID_HOME}" "${ANDROID_AVD_HOME}"
@@ -222,35 +226,73 @@ jobs:
           SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
           AVDMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager"
 
-          echo "Installing Android 13 System Image (Google Play x86_64) & Emulator..."
+          echo "Installing Lightweight Android 11 (API 30) System Image..."
           yes | "$SDKMANAGER" --sdk_root="${ANDROID_HOME}" --licenses >/dev/null 2>&1
           "$SDKMANAGER" --sdk_root="${ANDROID_HOME}" \
             "platform-tools" \
             "emulator" \
-            "system-images;android-33;google_apis_playstore;x86_64" >/dev/null 2>&1
+            "system-images;android-30;default;x86_64" >/dev/null 2>&1
 
-          echo "Creating Android 13 Virtual Device..."
+          echo "Creating Ultra-Wide Tablet AVD (1600x900)..."
           echo "no" | sudo -u black env \
             ANDROID_HOME="${ANDROID_HOME}" \
             ANDROID_AVD_HOME="${ANDROID_AVD_HOME}" \
             "$AVDMANAGER" create avd \
             -f \
             -n android \
-            -k "system-images;android-33;google_apis_playstore;x86_64" >/dev/null 2>&1
+            -k "system-images;android-30;default;x86_64" >/dev/null 2>&1
 
           CONFIG_INI="${ANDROID_AVD_HOME}/avd/android.avd/config.ini"
           if [ -f "$CONFIG_INI" ]; then
             cat << 'EOF' | sudo -u black tee -a "$CONFIG_INI" >/dev/null
-          hw.lcd.width=1280
-          hw.lcd.height=720
-          hw.lcd.density=213
+          hw.lcd.width=1600
+          hw.lcd.height=900
+          hw.lcd.density=200
           hw.keyboard=yes
-          hw.ramSize=4096
+          hw.ramSize=6144
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
           disk.dataPartition.size=8G
           EOF
-            echo "SUCCESS: Android 13 with Google Play is installed and ready."
+          fi
+
+          echo "Pre-booting Android 11 to complete first-time optimization..."
+          sudo -u black env \
+            ANDROID_HOME="${ANDROID_HOME}" \
+            ANDROID_AVD_HOME="${ANDROID_AVD_HOME}" \
+            "$ANDROID_HOME/emulator/emulator" \
+            -avd android \
+            -no-window \
+            -no-boot-anim \
+            -no-audio \
+            -no-snapshot \
+            -gpu swiftshader_indirect \
+            -memory 6144 \
+            -cores 4 >/tmp/android-preboot.log 2>&1 &
+
+          BOOTED=0
+          for i in $(seq 1 30); do
+            sleep 3
+            STATUS=$(sudo -u black "$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ')
+            if [ "$STATUS" = "1" ]; then
+              BOOTED=1
+              break
+            fi
+          done
+
+          if [ "$BOOTED" -eq 1 ]; then
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" shell settings put global window_animation_scale 0
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" shell settings put global transition_animation_scale 0
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" shell settings put global animator_duration_scale 0
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" shell settings put system screen_off_timeout 2147483647
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" shell settings put global stay_on_while_plugged_in 7
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" shell cmd uimode night yes
+            sudo -u black "$ANDROID_HOME/platform-tools/adb" emu kill >/dev/null 2>&1 || true
+            sleep 3
+            echo "SUCCESS: Android 11 pre-booted and optimized for instant startup."
           else
-            echo "WARNING: AVD config.ini was not created."
+            echo "WARNING: Pre-boot timed out, will boot normally on login."
+            pkill -f "qemu-system-x86_64" >/dev/null 2>&1 || true
           fi
           exit 0
 
@@ -271,11 +313,12 @@ jobs:
           if ! pgrep -f "qemu-system-x86_64" >/dev/null; then
             "$ANDROID_HOME/emulator/emulator" \
               -avd android \
-              -no-snapshot \
+              -skin 1600x900 \
               -no-boot-anim \
               -no-audio \
+              -no-snapshot \
               -gpu swiftshader_indirect \
-              -memory 4096 \
+              -memory 6144 \
               -cores 4 >/tmp/android-emulator.log 2>&1 &
           fi
           EOF
@@ -283,7 +326,7 @@ jobs:
           sudo chmod +x "$LAUNCH_SCRIPT"
           sudo chown -R black:black /home/black
           sudo systemctl restart xrdp
-          echo "SUCCESS: Android launcher configured."
+          echo "SUCCESS: Android 11 launcher configured."
           exit 0
 
       - name: Connection Info
@@ -336,7 +379,7 @@ jobs:
           echo "Host: $(hostname)"
           echo "User: $(whoami)"
           echo "Started at: $(date)"
-          echo "XRDP (Openbox) & Android 13 AVD are ready."
+          echo "XRDP & Android 11 (1600x900 Tablet) ready."
           echo "============================================"
           EOF
 
