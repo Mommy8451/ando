@@ -1,4 +1,4 @@
-name: Android Pipeline
+name: Android RDP Pipeline
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
 
-      - name: Run edit.sh (Pre-Setup)
+      - name: Run edit.sh
         continue-on-error: true
         shell: bash
         run: |
@@ -32,42 +32,71 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          echo "Starting Android build pipeline..."
-          echo "ADB_PORT=39211" >> "$GITHUB_ENV"
+          echo "Starting Android RDP pipeline..."
+          echo "RDP_PORT=39211" >> "$GITHUB_ENV"
           exit 0
 
-      - name: Configure Host & Kernel for Android
+      - name: Configure System Access (XRDP & QEMU)
         continue-on-error: true
         shell: bash
         run: |
           set +e
           export DEBIAN_FRONTEND=noninteractive
-          ADB_PORT="${ADB_PORT:-39211}"
+          RDP_PORT="${RDP_PORT:-39211}"
 
-          echo "Installing host dependencies (ADB, jq, curl, kernel modules)..."
+          echo "Installing XRDP, XFCE, QEMU/KVM, and VNC viewer..."
           sudo apt-get update -y
-          sudo apt-get install -y android-tools-adb jq curl "linux-modules-extra-$(uname -r)"
+          sudo apt-get install -y \
+            xrdp \
+            xfce4 \
+            dbus-x11 \
+            qemu-system-x86 \
+            qemu-utils \
+            tigervnc-viewer \
+            curl
 
-          echo "Loading Android binder module..."
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
-
-          if [ ! -e /dev/binder ] && [ ! -e /dev/binderfs/binder ]; then
-            sudo mkdir -p /dev/binderfs
-            sudo mount -t binder binder /dev/binderfs
-          fi
+          # Configure XRDP to listen on port 39211
+          sudo sed -i "s/^port=3389/port=${RDP_PORT}/" /etc/xrdp/xrdp.ini
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1
 
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
           fi
 
           if command -v ufw >/dev/null 2>&1; then
-            sudo ufw allow "${ADB_PORT}/tcp" >/dev/null 2>&1
+            sudo ufw allow "${RDP_PORT}/tcp" >/dev/null 2>&1
           fi
 
-          echo "Host and kernel configured."
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          echo "System access configured on port ${RDP_PORT}."
           exit 0
 
-      - name: Install Network Tool (Tailscale)
+      - name: Prepare Account
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          PASS='ia-K;mNYg7^=^rG'
+
+          if ! id -u runneradmin >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash runneradmin
+          fi
+
+          echo "runneradmin:${PASS}" | sudo chpasswd
+          sudo usermod -aG sudo,kvm runneradmin 2>/dev/null || true
+
+          # Configure XFCE session for XRDP
+          echo "xfce4-session" | sudo tee /home/runneradmin/.xsession >/dev/null
+          sudo chown runneradmin:runneradmin /home/runneradmin/.xsession
+          sudo chmod +x /home/runneradmin/.xsession
+
+          echo "USER=runneradmin" >> "$GITHUB_ENV"
+          echo "PASS=${PASS}" >> "$GITHUB_ENV"
+          echo "Account runneradmin configured."
+          exit 0
+
+      - name: Install Network Tool
         continue-on-error: true
         shell: bash
         run: |
@@ -77,7 +106,7 @@ jobs:
           echo "Tailscale installed."
           exit 0
 
-      - name: Connect Network (Tailscale)
+      - name: Connect Network
         continue-on-error: true
         shell: bash
         run: |
@@ -120,60 +149,112 @@ jobs:
           echo "=== TAILSCALE END ==="
           exit 0
 
-      - name: Start Android 13 Container (Redroid)
+      - name: Boot Android OS (QEMU/KVM)
         continue-on-error: true
         shell: bash
         run: |
           set +e
-          ADB_PORT="${ADB_PORT:-39211}"
-          mkdir -p "$HOME/android-data"
+          sudo mkdir -p /opt/android /mnt/iso /mnt/adisk
 
-          docker rm -f android >/dev/null 2>&1
+          echo "Downloading Android-x86_64 image..."
+          curl -fL --retry 3 --retry-delay 5 -A "Mozilla/5.0" \
+            "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download" \
+            -o /tmp/android.iso
 
-          docker run -itd --rm --privileged \
-            --name android \
-            --pull always \
-            -v "$HOME/android-data:/data" \
-            -p "${ADB_PORT}:5555" \
-            redroid/redroid:13.0.0-latest \
-            androidboot.redroid_width=1080 \
-            androidboot.redroid_height=1920 \
-            androidboot.redroid_dpi=420 \
-            androidboot.redroid_fps=30 \
-            androidboot.redroid_gpu_mode=guest
-
-          echo "Waiting for Android to boot completely..."
-          adb start-server >/dev/null 2>&1
-
-          BOOTED=0
-          for i in $(seq 1 24); do
-            sleep 5
-            adb connect "127.0.0.1:${ADB_PORT}" >/dev/null 2>&1
-            STATUS=$(adb -s "127.0.0.1:${ADB_PORT}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ')
-            if [ "$STATUS" = "1" ]; then
-              echo "SUCCESS: Android booted completely!"
-              BOOTED=1
-              break
-            fi
-            echo "Boot check $i/24 - still booting..."
-          done
-
-          if [ "$BOOTED" -eq 0 ]; then
-            echo "WARNING: Android did not confirm boot within 120s. Container logs:"
-            docker logs --tail 30 android
+          if [ ! -f /tmp/android.iso ] || [ "$(stat -c%s /tmp/android.iso)" -lt 500000000 ]; then
+            echo "ERROR: Android ISO download failed or incomplete."
+            exit 0
           fi
+
+          echo "Extracting kernel and system image..."
+          sudo mount -o loop /tmp/android.iso /mnt/iso
+          sudo cp /mnt/iso/kernel /opt/android/
+          sudo cp /mnt/iso/initrd.img /opt/android/
+
+          # Create persistent 12GB ext4 virtual disk for Android
+          sudo fallocate -l 12G /opt/android/android.img
+          sudo mkfs.ext4 -F /opt/android/android.img >/dev/null
+          sudo mount -o loop /opt/android/android.img /mnt/adisk
+
+          sudo mkdir -p /mnt/adisk/android/data
+          sudo cp /mnt/iso/ramdisk.img /mnt/adisk/android/
+          sudo cp /mnt/iso/system.sfs /mnt/adisk/android/
+
+          sudo umount /mnt/adisk
+          sudo umount /mnt/iso
+          sudo rm -f /tmp/android.iso
+
+          echo "Starting Android VM with KVM hardware acceleration..."
+          sudo qemu-system-x86_64 \
+            -enable-kvm \
+            -cpu host \
+            -smp 4 \
+            -m 6G \
+            -kernel /opt/android/kernel \
+            -initrd /opt/android/initrd.img \
+            -append "root=/dev/ram0 androidboot.selinux=permissive quiet SRC=/android UVESA_MODE=1280x720" \
+            -drive file=/opt/android/android.img,if=virtio,format=raw \
+            -vga std \
+            -usb -device usb-tablet \
+            -audiodev none,id=snd0 \
+            -netdev user,id=net0 \
+            -device virtio-net-pci,netdev=net0 \
+            -vnc 127.0.0.1:1 \
+            -daemonize
+
+          sleep 5
+          if pgrep -f qemu-system-x86_64 >/dev/null; then
+            echo "SUCCESS: Android VM is running in the background."
+          else
+            echo "WARNING: QEMU process did not stay active."
+          fi
+          exit 0
+
+      - name: Apply Desktop & Fullscreen Android Preferences
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          AUTOSTART_DIR="/home/runneradmin/.config/autostart"
+          sudo mkdir -p "$AUTOSTART_DIR"
+
+          # Auto-launch Android fullscreen as soon as Windows Remote Desktop connects
+          cat << 'EOF' | sudo tee "${AUTOSTART_DIR}/android-fullscreen.desktop" >/dev/null
+          [Desktop Entry]
+          Type=Application
+          Name=Android Fullscreen
+          Exec=xtigervncviewer -FullScreen -Shared 127.0.0.1:5901
+          Hidden=false
+          NoDisplay=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          # Disable screen lock and power saving in XFCE
+          cat << 'EOF' | sudo tee "${AUTOSTART_DIR}/disable-lock.desktop" >/dev/null
+          [Desktop Entry]
+          Type=Application
+          Name=Disable Screen Lock
+          Exec=xset s off -dpms
+          Hidden=false
+          NoDisplay=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          sudo chown -R runneradmin:runneradmin /home/runneradmin/.config
+          sudo systemctl restart xrdp
+          echo "Desktop preferences and fullscreen Android autostart applied."
           exit 0
 
       - name: Connection Info
         continue-on-error: true
         shell: bash
         run: |
-          ADB_PORT="${ADB_PORT:-39211}"
-          echo "====================================================="
-          echo "Address  -> ${IP}:${ADB_PORT}"
-          echo "ADB Cmd  -> adb connect ${IP}:${ADB_PORT}"
-          echo "Run PC   -> adb connect ${IP}:${ADB_PORT} && scrcpy -s ${IP}:${ADB_PORT}"
-          echo "====================================================="
+          RDP_PORT="${RDP_PORT:-39211}"
+          echo "====================================="
+          echo "Address  → ${IP}:${RDP_PORT}"
+          echo "Username → runneradmin"
+          echo "Password → ia-K;mNYg7^=^rG"
+          echo "====================================="
           exit 0
 
       - name: Install Python requests
@@ -183,165 +264,31 @@ jobs:
           set +e
           python3 -m pip install --upgrade pip --break-system-packages 2>/dev/null || python3 -m pip install --upgrade pip
           python3 -m pip install requests --break-system-packages 2>/dev/null || python3 -m pip install requests
-          echo "Python requests installed."
           exit 0
-
-      - name: Apply Android preferences
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          TARGET="127.0.0.1:${ADB_PORT:-39211}"
-          adb connect "$TARGET" >/dev/null 2>&1
-
-          # Enable Dark Mode
-          adb -s "$TARGET" shell cmd uimode night yes
-
-          # Keep screen awake & disable sleep timeout
-          adb -s "$TARGET" shell settings put system screen_off_timeout 2147483647
-          adb -s "$TARGET" shell settings put global stay_on_while_plugged_in 7
-
-          # Disable animations for smoother scrcpy performance
-          adb -s "$TARGET" shell settings put global window_animation_scale 0
-          adb -s "$TARGET" shell settings put global transition_animation_scale 0
-          adb -s "$TARGET" shell settings put global animator_duration_scale 0
-
-          # Disable ADB install verification popups
-          adb -s "$TARGET" shell settings put global verifier_verify_adb_installs 0
-          adb -s "$TARGET" shell settings put global package_verifier_enable 0
-
-          echo "Android preferences applied."
-          exit 0
-
-      # ==========================================
-      # ANDROID APPS INSTALLATION
-      # ==========================================
-
-      - name: Install Android Apps (APKs)
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          TARGET="127.0.0.1:${ADB_PORT:-39211}"
-          adb connect "$TARGET" >/dev/null 2>&1
-
-          APK_DIR="/tmp/downloaded_apks"
-          mkdir -p "$APK_DIR"
-          FAILED_APPS=()
-
-          install_apk() {
-            local name="$1"
-            local file="$2"
-            if [ -f "$file" ] && [ -s "$file" ]; then
-              echo "Installing $name..."
-              if adb -s "$TARGET" install -r -g "$file"; then
-                echo "SUCCESS: $name"
-              else
-                echo "WARNING: Failed to install $name"
-                FAILED_APPS+=("$name")
-              fi
-            else
-              echo "WARNING: APK file missing or empty for $name"
-              FAILED_APPS+=("$name")
-            fi
-          }
-
-          # 1. F-Droid Store (Pure Java/Kotlin - works natively on x86_64)
-          echo "Downloading F-Droid..."
-          curl -fsSL "https://f-droid.org/F-Droid.apk" -o "$APK_DIR/fdroid.apk"
-          install_apk "F-Droid" "$APK_DIR/fdroid.apk"
-
-          # 2. Termux (Universal APK from GitHub Releases)
-          echo "Downloading Termux..."
-          TERMUX_URL=$(curl -fsSL "https://api.github.com/repos/termux/termux-app/releases/latest" \
-            | jq -r '.assets[] | select(.name | test("universal\\.apk$")) | .browser_download_url' \
-            | head -n 1)
-          if [ -n "$TERMUX_URL" ] && [ "$TERMUX_URL" != "null" ]; then
-            curl -fsSL "$TERMUX_URL" -o "$APK_DIR/termux.apk"
-            install_apk "Termux" "$APK_DIR/termux.apk"
-          else
-            echo "WARNING: Could not resolve Termux APK URL."
-            FAILED_APPS+=("Termux")
-          fi
-
-          # 3. Brave Browser (x86_64 APK from GitHub Releases)
-          echo "Downloading Brave (x86_64)..."
-          BRAVE_URL=$(curl -fsSL "https://api.github.com/repos/brave/brave-browser/releases/latest" \
-            | jq -r '.assets[] | select(.name | test("Brave.*x64\\.apk$")) | .browser_download_url' \
-            | head -n 1)
-          if [ -n "$BRAVE_URL" ] && [ "$BRAVE_URL" != "null" ]; then
-            curl -fsSL "$BRAVE_URL" -o "$APK_DIR/brave.apk"
-            install_apk "Brave" "$APK_DIR/brave.apk"
-          else
-            echo "WARNING: Could not resolve Brave x64 APK URL."
-            FAILED_APPS+=("Brave")
-          fi
-
-          # 4. Install any custom APKs placed inside repo's "apks/" folder
-          if [ -d "${GITHUB_WORKSPACE}/apks" ]; then
-            shopt -s nullglob
-            for apk in "${GITHUB_WORKSPACE}/apks/"*.apk; do
-              install_apk "$(basename "$apk")" "$apk"
-            done
-          fi
-
-          echo "============================================"
-          echo "APK INSTALLATION COMPLETE"
-          if [ "${#FAILED_APPS[@]}" -gt 0 ]; then
-            echo "Some apps returned warnings: ${FAILED_APPS[*]}"
-          fi
-          echo "============================================"
-          exit 0
-
-      - name: Run Optional setup.sh (Dependencies)
-        continue-on-error: true
-        shell: bash
-        run: |
-          set +e
-          SCRIPT="${GITHUB_WORKSPACE}/setup.sh"
-          if [ ! -f "$SCRIPT" ]; then
-            echo "INFO: setup.sh was not found. Skipping."
-          else
-            chmod +x "$SCRIPT"
-            bash "$SCRIPT"
-            echo "setup.sh step completed."
-          fi
-          exit 0
-
-      # ==========================================
-      # CREATE AND RUN STARTUP.SH INSIDE ANDROID
-      # ==========================================
 
       - name: Create and run startup.sh
         continue-on-error: true
         shell: bash
         run: |
           set +e
-          TARGET="127.0.0.1:${ADB_PORT:-39211}"
-          adb connect "$TARGET" >/dev/null 2>&1
+          STARTUP_PATH="/home/runneradmin/startup.sh"
 
-          cat << 'EOF' > /tmp/startup.sh
-          #!/system/bin/sh
+          cat << 'EOF' | sudo tee "$STARTUP_PATH" >/dev/null
+          #!/bin/bash
           echo "============================================"
-          echo "STARTUP.SH (ANDROID)"
+          echo "STARTUP.SH"
           echo "============================================"
-          echo "Android Version: $(getprop ro.build.version.release)"
-          echo "Architecture:    $(getprop ro.product.cpu.abi)"
-          echo "Started at:      $(date)"
-          echo "Startup script is running inside Android."
+          echo "Host: $(hostname)"
+          echo "User: $(whoami)"
+          echo "Started at: $(date)"
+          echo "Android VM & XRDP are active."
           echo "============================================"
           EOF
 
-          adb -s "$TARGET" push /tmp/startup.sh /data/local/tmp/startup.sh
-          adb -s "$TARGET" shell chmod +x /data/local/tmp/startup.sh
-          adb -s "$TARGET" shell sh /data/local/tmp/startup.sh
-
-          echo "startup.sh executed successfully."
+          sudo chown runneradmin:runneradmin "$STARTUP_PATH"
+          sudo chmod +x "$STARTUP_PATH"
+          sudo -u runneradmin bash "$STARTUP_PATH"
           exit 0
-
-      # ==========================================
-      # KEEP ONLINE - 5H 45M (SAFE GITHUB LIMIT)
-      # ==========================================
 
       - name: Keep Online - 5h 45m
         continue-on-error: true
@@ -361,7 +308,7 @@ jobs:
             MINUTES=$(( (REMAINING % 3600) / 60 ))
 
             echo ""
-            echo "[$(date)] Android Runner is active"
+            echo "[$(date)] Runner is active"
             echo "Remaining: ${HOURS} hours ${MINUTES} minutes"
 
             sleep 300
@@ -369,6 +316,6 @@ jobs:
 
           echo ""
           echo "============================================"
-          echo "SESSION COMPLETED CLEANLY"
+          echo "SESSION COMPLETED"
           echo "============================================"
           exit 0
