@@ -1,0 +1,374 @@
+name: Android Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository files
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Run edit.sh (Pre-Setup)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          SCRIPT="${GITHUB_WORKSPACE}/edit.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "INFO: edit.sh was not found. Skipping."
+          else
+            chmod +x "$SCRIPT"
+            bash "$SCRIPT"
+            echo "edit.sh step completed."
+          fi
+          exit 0
+
+      - name: Initialize
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Starting Android build pipeline..."
+          echo "ADB_PORT=39211" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Configure Host & Kernel for Android
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          export DEBIAN_FRONTEND=noninteractive
+          ADB_PORT="${ADB_PORT:-39211}"
+
+          echo "Installing host dependencies (ADB, jq, curl, kernel modules)..."
+          sudo apt-get update -y
+          sudo apt-get install -y android-tools-adb jq curl "linux-modules-extra-$(uname -r)"
+
+          echo "Loading Android binder module..."
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+
+          if [ ! -e /dev/binder ] && [ ! -e /dev/binderfs/binder ]; then
+            sudo mkdir -p /dev/binderfs
+            sudo mount -t binder binder /dev/binderfs
+          fi
+
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+          fi
+
+          if command -v ufw >/dev/null 2>&1; then
+            sudo ufw allow "${ADB_PORT}/tcp" >/dev/null 2>&1
+          fi
+
+          echo "Host and kernel configured."
+          exit 0
+
+      - name: Install Network Tool (Tailscale)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          echo "Tailscale installed."
+          exit 0
+
+      - name: Connect Network (Tailscale)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          echo "=== TAILSCALE START ==="
+
+          KEY="${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if [ "${#KEY}" -lt 10 ]; then
+            echo "WARNING: TAILSCALE_AUTH_KEY is empty or too short."
+          else
+            sudo tailscale logout >/dev/null 2>&1
+
+            sudo tailscale up \
+              --authkey="${KEY}" \
+              --hostname="android-builder-${{ github.run_id }}" \
+              --reset \
+              --accept-routes=false \
+              --accept-dns=false
+
+            tailscale status
+
+            IP=""
+            for i in $(seq 1 12); do
+              sleep 5
+              IP=$(tailscale ip -4 2>/dev/null | head -n 1 | tr -d '[:space:]')
+              if [ -n "$IP" ]; then
+                echo "Tailscale IP = $IP"
+                break
+              fi
+              echo "Attempt $i/12 - no IP yet..."
+            done
+
+            if [ -n "$IP" ]; then
+              echo "IP=$IP" >> "$GITHUB_ENV"
+            else
+              echo "WARNING: Could not obtain Tailscale IP."
+            fi
+          fi
+
+          echo "=== TAILSCALE END ==="
+          exit 0
+
+      - name: Start Android 13 Container (Redroid)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          ADB_PORT="${ADB_PORT:-39211}"
+          mkdir -p "$HOME/android-data"
+
+          docker rm -f android >/dev/null 2>&1
+
+          docker run -itd --rm --privileged \
+            --name android \
+            --pull always \
+            -v "$HOME/android-data:/data" \
+            -p "${ADB_PORT}:5555" \
+            redroid/redroid:13.0.0-latest \
+            androidboot.redroid_width=1080 \
+            androidboot.redroid_height=1920 \
+            androidboot.redroid_dpi=420 \
+            androidboot.redroid_fps=30 \
+            androidboot.redroid_gpu_mode=guest
+
+          echo "Waiting for Android to boot completely..."
+          adb start-server >/dev/null 2>&1
+
+          BOOTED=0
+          for i in $(seq 1 24); do
+            sleep 5
+            adb connect "127.0.0.1:${ADB_PORT}" >/dev/null 2>&1
+            STATUS=$(adb -s "127.0.0.1:${ADB_PORT}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ')
+            if [ "$STATUS" = "1" ]; then
+              echo "SUCCESS: Android booted completely!"
+              BOOTED=1
+              break
+            fi
+            echo "Boot check $i/24 - still booting..."
+          done
+
+          if [ "$BOOTED" -eq 0 ]; then
+            echo "WARNING: Android did not confirm boot within 120s. Container logs:"
+            docker logs --tail 30 android
+          fi
+          exit 0
+
+      - name: Connection Info
+        continue-on-error: true
+        shell: bash
+        run: |
+          ADB_PORT="${ADB_PORT:-39211}"
+          echo "====================================================="
+          echo "Address  -> ${IP}:${ADB_PORT}"
+          echo "ADB Cmd  -> adb connect ${IP}:${ADB_PORT}"
+          echo "Run PC   -> adb connect ${IP}:${ADB_PORT} && scrcpy -s ${IP}:${ADB_PORT}"
+          echo "====================================================="
+          exit 0
+
+      - name: Install Python requests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python3 -m pip install --upgrade pip --break-system-packages 2>/dev/null || python3 -m pip install --upgrade pip
+          python3 -m pip install requests --break-system-packages 2>/dev/null || python3 -m pip install requests
+          echo "Python requests installed."
+          exit 0
+
+      - name: Apply Android preferences
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          TARGET="127.0.0.1:${ADB_PORT:-39211}"
+          adb connect "$TARGET" >/dev/null 2>&1
+
+          # Enable Dark Mode
+          adb -s "$TARGET" shell cmd uimode night yes
+
+          # Keep screen awake & disable sleep timeout
+          adb -s "$TARGET" shell settings put system screen_off_timeout 2147483647
+          adb -s "$TARGET" shell settings put global stay_on_while_plugged_in 7
+
+          # Disable animations for smoother scrcpy performance
+          adb -s "$TARGET" shell settings put global window_animation_scale 0
+          adb -s "$TARGET" shell settings put global transition_animation_scale 0
+          adb -s "$TARGET" shell settings put global animator_duration_scale 0
+
+          # Disable ADB install verification popups
+          adb -s "$TARGET" shell settings put global verifier_verify_adb_installs 0
+          adb -s "$TARGET" shell settings put global package_verifier_enable 0
+
+          echo "Android preferences applied."
+          exit 0
+
+      # ==========================================
+      # ANDROID APPS INSTALLATION
+      # ==========================================
+
+      - name: Install Android Apps (APKs)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          TARGET="127.0.0.1:${ADB_PORT:-39211}"
+          adb connect "$TARGET" >/dev/null 2>&1
+
+          APK_DIR="/tmp/downloaded_apks"
+          mkdir -p "$APK_DIR"
+          FAILED_APPS=()
+
+          install_apk() {
+            local name="$1"
+            local file="$2"
+            if [ -f "$file" ] && [ -s "$file" ]; then
+              echo "Installing $name..."
+              if adb -s "$TARGET" install -r -g "$file"; then
+                echo "SUCCESS: $name"
+              else
+                echo "WARNING: Failed to install $name"
+                FAILED_APPS+=("$name")
+              fi
+            else
+              echo "WARNING: APK file missing or empty for $name"
+              FAILED_APPS+=("$name")
+            fi
+          }
+
+          # 1. F-Droid Store (Pure Java/Kotlin - works natively on x86_64)
+          echo "Downloading F-Droid..."
+          curl -fsSL "https://f-droid.org/F-Droid.apk" -o "$APK_DIR/fdroid.apk"
+          install_apk "F-Droid" "$APK_DIR/fdroid.apk"
+
+          # 2. Termux (Universal APK from GitHub Releases)
+          echo "Downloading Termux..."
+          TERMUX_URL=$(curl -fsSL "https://api.github.com/repos/termux/termux-app/releases/latest" \
+            | jq -r '.assets[] | select(.name | test("universal\\.apk$")) | .browser_download_url' \
+            | head -n 1)
+          if [ -n "$TERMUX_URL" ] && [ "$TERMUX_URL" != "null" ]; then
+            curl -fsSL "$TERMUX_URL" -o "$APK_DIR/termux.apk"
+            install_apk "Termux" "$APK_DIR/termux.apk"
+          else
+            echo "WARNING: Could not resolve Termux APK URL."
+            FAILED_APPS+=("Termux")
+          fi
+
+          # 3. Brave Browser (x86_64 APK from GitHub Releases)
+          echo "Downloading Brave (x86_64)..."
+          BRAVE_URL=$(curl -fsSL "https://api.github.com/repos/brave/brave-browser/releases/latest" \
+            | jq -r '.assets[] | select(.name | test("Brave.*x64\\.apk$")) | .browser_download_url' \
+            | head -n 1)
+          if [ -n "$BRAVE_URL" ] && [ "$BRAVE_URL" != "null" ]; then
+            curl -fsSL "$BRAVE_URL" -o "$APK_DIR/brave.apk"
+            install_apk "Brave" "$APK_DIR/brave.apk"
+          else
+            echo "WARNING: Could not resolve Brave x64 APK URL."
+            FAILED_APPS+=("Brave")
+          fi
+
+          # 4. Install any custom APKs placed inside repo's "apks/" folder
+          if [ -d "${GITHUB_WORKSPACE}/apks" ]; then
+            shopt -s nullglob
+            for apk in "${GITHUB_WORKSPACE}/apks/"*.apk; do
+              install_apk "$(basename "$apk")" "$apk"
+            done
+          fi
+
+          echo "============================================"
+          echo "APK INSTALLATION COMPLETE"
+          if [ "${#FAILED_APPS[@]}" -gt 0 ]; then
+            echo "Some apps returned warnings: ${FAILED_APPS[*]}"
+          fi
+          echo "============================================"
+          exit 0
+
+      - name: Run Optional setup.sh (Dependencies)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          SCRIPT="${GITHUB_WORKSPACE}/setup.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "INFO: setup.sh was not found. Skipping."
+          else
+            chmod +x "$SCRIPT"
+            bash "$SCRIPT"
+            echo "setup.sh step completed."
+          fi
+          exit 0
+
+      # ==========================================
+      # CREATE AND RUN STARTUP.SH INSIDE ANDROID
+      # ==========================================
+
+      - name: Create and run startup.sh
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          TARGET="127.0.0.1:${ADB_PORT:-39211}"
+          adb connect "$TARGET" >/dev/null 2>&1
+
+          cat << 'EOF' > /tmp/startup.sh
+          #!/system/bin/sh
+          echo "============================================"
+          echo "STARTUP.SH (ANDROID)"
+          echo "============================================"
+          echo "Android Version: $(getprop ro.build.version.release)"
+          echo "Architecture:    $(getprop ro.product.cpu.abi)"
+          echo "Started at:      $(date)"
+          echo "Startup script is running inside Android."
+          echo "============================================"
+          EOF
+
+          adb -s "$TARGET" push /tmp/startup.sh /data/local/tmp/startup.sh
+          adb -s "$TARGET" shell chmod +x /data/local/tmp/startup.sh
+          adb -s "$TARGET" shell sh /data/local/tmp/startup.sh
+
+          echo "startup.sh executed successfully."
+          exit 0
+
+      # ==========================================
+      # KEEP ONLINE - 5H 45M (SAFE GITHUB LIMIT)
+      # ==========================================
+
+      - name: Keep Online - 5h 45m
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          TOTAL_SECONDS=$((5 * 3600 + 45 * 60))
+
+          echo "============================================"
+          echo "KEEP ONLINE MODE"
+          echo "Duration: 5 hours 45 minutes"
+          echo "============================================"
+
+          for ((i=0; i<TOTAL_SECONDS; i+=300)); do
+            REMAINING=$((TOTAL_SECONDS - i))
+            HOURS=$((REMAINING / 3600))
+            MINUTES=$(( (REMAINING % 3600) / 60 ))
+
+            echo ""
+            echo "[$(date)] Android Runner is active"
+            echo "Remaining: ${HOURS} hours ${MINUTES} minutes"
+
+            sleep 300
+          done
+
+          echo ""
+          echo "============================================"
+          echo "SESSION COMPLETED CLEANLY"
+          echo "============================================"
+          exit 0
